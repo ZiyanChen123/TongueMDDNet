@@ -1,0 +1,10 @@
+对照组舌苔/
+文献参考/
+舌苔/
+coating_mask/
+compair_kmean/
+mask/
+resnet_test.pth
+/__pycache__
+/img_rawdata
+cp.ps1
