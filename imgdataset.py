@@ -1,7 +1,7 @@
 import os
-import glob
 import cv2
 import torch
+import random
 from torch import nn
 from PIL import Image, ImageOps
 import models
@@ -13,9 +13,8 @@ import matplotlib.pyplot as plt                                 # 可视化
 plt.rcParams["font.family"] = ["SimHei"]                        # 中文字体
 plt.rcParams['axes.unicode_minus'] = False                      # 解决负号显示问题
 
-# 生成训练集测试集，目前也测试训练模型
-np.random.seed(42)  
-torch.manual_seed(42)
+# np.random.seed(42)
+# torch.manual_seed(42)
 
 class ImageDataset(Dataset):
     def __init__(self, imgs, metrics, labels):
@@ -27,7 +26,7 @@ class ImageDataset(Dataset):
         return len(self.imgs)
 
     def __getitem__(self, idx):
-        img = self.imgs[idx].astype(np.float32) / 255.0              # 归一化
+        img = self.imgs[idx].astype(np.float32) / 255.0             # 归一化
         img = torch.from_numpy(img).permute(2, 0, 1)
         metric = torch.from_numpy(self.metrics[idx])
         metric = (metric - metric.mean()) / (metric.std() + 1e-8)   # 标准化
@@ -35,72 +34,102 @@ class ImageDataset(Dataset):
 
         return img, metric, label
 
-
-
 imgs = []
 metrics = []
 labels = []
-
 valid_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
 
+
+def AUG(img):
+    """图像增强函数,生成12张处理后的图像"""
+    augmented_imgs = []
+    img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+    h, w = img.shape[:2]
+
+    # 生成基础翻转图像（包含原图+3种翻转）
+    base_imgs = [
+        img,                  # 原图
+        cv2.flip(img, 1),     # 水平翻转
+        cv2.flip(img, 0),     # 垂直翻转
+        cv2.flip(img, -1)     # 水平+垂直翻转
+    ]
+
+    # 裁剪和色彩增强
+    for base_img in base_imgs:
+        # 随机裁剪：面积为10%~100%的区域，裁剪后resize回224x224
+        area_ratio = random.uniform(0.1, 1.0)
+        crop_w = int(w * np.sqrt(area_ratio))
+        crop_h = int(h * np.sqrt(area_ratio))
+        x_start = random.randint(0, w - crop_w)
+        y_start = random.randint(0, h - crop_h)
+        img_crop = base_img[y_start:y_start+crop_h, x_start:x_start+crop_w]
+        img_crop_resize = cv2.resize(img_crop, (224, 224), interpolation=cv2.INTER_AREA)
+        augmented_imgs.append(img_crop_resize)
+
+        # 随机改变亮度、对比度、饱和度、色调（基于HSV空间处理）
+        img_hsv = cv2.cvtColor(base_img, cv2.COLOR_BGR2HSV)
+        h_delta = random.randint(-10, 10)
+        img_hsv[:, :, 0] = (img_hsv[:, :, 0] + h_delta) % 180
+        s_scale = random.uniform(0.7, 1.3)
+        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * s_scale, 0, 255)
+        v_scale = random.uniform(0.7, 1.3)
+        img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * v_scale, 0, 255)
+        img_color = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
+        augmented_imgs.append(img_color)
+
+    augmented_imgs = [aug for aug in augmented_imgs if aug.shape == (224,224,3)]
+    augmented_imgs.extend(base_imgs)
+    
+    return augmented_imgs
+
 def _process_folder(folder_path, label):
-    # =================读入对照组=================
+    # 读入数据集
     for fname in os.listdir(folder_path):
         ext = os.path.splitext(fname)[1].lower()
         if ext in valid_exts:
             full_path = os.path.join(folder_path, fname)
             img = Image.open(full_path).convert("RGB")
-            img = ImageOps.exif_transpose(img)  # 处理可能的EXIF旋转
+            img = ImageOps.exif_transpose(img)  # 处理EXIF旋转
             img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             H, W = img.shape[:2]
 
-            mask = Image.open("./mask/" + os.path.splitext(fname)[0] + ".png")
+            # 读取并处理mask
+            mask_path = os.path.join("./mask", os.path.splitext(fname)[0] + ".png")
+            if not os.path.exists(mask_path):
+                print(f"警告 未找到mask文件 {mask_path}，跳过该图像")
+                continue
+            mask = Image.open(mask_path)
             mask = np.array(ImageOps.exif_transpose(mask))
+            mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+            img[~mask] = [0, 0, 0]  # Mask外设为黑色
 
-            mask = cv2.resize(mask, (W, H),
-                        interpolation=cv2.INTER_NEAREST).astype(bool)
-            img[~mask] = [0, 0, 0]  # 将 Mask 外的像素设为黑色
-
-            
+            # 裁剪到mask有效区域
             coords = np.argwhere(mask > 0)
-
+            if len(coords) == 0:
+                print(f"警告：{fname} 的mask无有效区域")
+                continue
             y_min, x_min = coords.min(axis=0)
             y_max, x_max = coords.max(axis=0)
-
             img_crop = img[y_min:y_max+1, x_min:x_max+1]
             img_crop = cv2.resize(img_crop, (224, 224), interpolation=cv2.INTER_AREA)
-            
+
+            # 1. 添加原图
             imgs.append(img_crop)
             labels.append(label)
-            metrics.append(image_features.convert_metrics_to_array(image_features.calculate_image_metrics(img_crop)))
+            metrics.append(image_features.convert_metrics_to_array(
+                image_features.calculate_image_metrics(img_crop)
+            ))
 
-            # ====== 数据增强：水平翻转 ======
-            img_flip = cv2.flip(img_crop, 1)
-            imgs.append(img_flip)
-            labels.append(label)
-            metrics.append(image_features.convert_metrics_to_array(image_features.calculate_image_metrics(img_flip)))
-
-            # ====== 数据增强：亮度扰动 ======
-            img_bright = cv2.convertScaleAbs(img_crop, alpha=1.0, beta=np.random.randint(-30, 30))
-            imgs.append(img_bright)
-            labels.append(label)
-            metrics.append(image_features.convert_metrics_to_array(image_features.calculate_image_metrics(img_bright)))
-
-            # angle = np.random.uniform(-5, 5)  # 随机旋转角度， 但发现这个data 96%argument会导致最后验证集准确率下降，原因未知
-            # h, w = img_crop.shape[:2]
-            # center = (w // 2, h // 2)
-            # M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            # img_rotate = cv2.warpAffine(img_crop, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-            # imgs.append(img_rotate)
-            # labels.append(label)
-            # metrics.append(image_features.convert_metrics_to_array(image_features.calculate_image_metrics(img_rotate)))
+            # 2. 调用增强函数，添加增强后的图像
+            augmented_imgs = AUG(img_crop)
+            for aug_img in augmented_imgs:
+                imgs.append(aug_img)
+                labels.append(label)
+                metrics.append(image_features.convert_metrics_to_array(
+                    image_features.calculate_image_metrics(aug_img)
+                ))
 
 
-            # ====== 可视化调试（保留原逻辑） ======
-            if np.random.randint(0, 300) < 1:
-                imgshow = cv2.cvtColor(img_bright, cv2.COLOR_BGR2RGB)
-                imgshow = Image.fromarray(imgshow)
-                imgshow.show()
 
 _process_folder("./对照组舌苔/对照组舌苔图像102例", label=0)
 _process_folder("./舌苔/1.MH健康对照组（有转录）", label=0)
@@ -111,12 +140,11 @@ _process_folder("./舌苔/3.MY抑郁组/type-2 2W", label=1)  # 抑郁组标签�
 _process_folder("./舌苔/3.MY抑郁组/type-3 4W", label=1)  # 抑郁组标签为1
             
 
-# Resnet_18训练测试（注释了“原版”的是仅输入图片的版本）
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EPOCHS = 60    # 测试用，可调整
 LR = 1e-4      # 学习率
 WEIGHT_DECAY = 1e-4  # 权重衰减
-SAVE_PATH = "./resnet_test.pth"
+SAVE_PATH = "./test.pth"
 
 handcraft_dim = np.array(metrics).shape[1]
 dataset = ImageDataset(imgs, metrics, labels)
