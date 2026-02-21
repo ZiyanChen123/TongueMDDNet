@@ -181,3 +181,121 @@ class ResNet_attn(nn.Module):
         # ========== 第四步：分类输出 ==========
         output = self.classifier(fused_feat)  # (batch, num_classes)
         return output
+
+###跨模态对齐方法###
+#占位，各种特征的编码器
+class ImageEmbedding(nn.Module):
+    def __init__(self, input_dim,hidden_dim):
+        super().__init__()
+
+    def forward(self,images):
+        return images
+    
+class HandcraftEmbedding(nn.Module):
+    def __init__(self, input_dim,hidden_dim):
+        super().__init__()
+
+    def forward(self,handcraft_features):
+        return handcraft_features
+    
+class AudioEmbedding(nn.Module):
+    def __init__(self, input_dim,hidden_dim):
+        super().__init__()
+
+    def forward(self,audios):
+        return audios
+    
+#1. 通过嵌入对齐和优化损失函数融合
+#基于余弦相似度的对比损失(训练时用这个损失函数)
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin = 1.0):
+        super().__init__()
+        self.margin =margin
+
+    def forward(self, image_embeddings,handcraft_embeddings,labels):
+        cosine_sim = torch.cosine_similarity(image_embeddings,handcraft_embeddings)
+        positive_loss = (1-labels)*(1-cosine_sim)
+        negative_loss = labels*torch.clamp(cosine_sim-self.margin,min=0)
+        return positive_loss.mean()+negative_loss.mean()
+
+    
+#2. 基于交叉注意力机制的跨模态对齐(以手工特征为锚点，图像特征主动对齐手工特征)
+class CrossModalAlignment(nn.Module):
+    def __init__(self,img_input_dim,handcraft_input_dim,embed_size,num_heads):
+        super().__init__()
+        self.image_proj = nn.Linear(img_input_dim,embed_size)
+        self.handcraft_proj = nn.Linear(handcraft_input_dim,embed_size)
+        self.attention = nn.MultiheadAttention(embed_dim=embed_size,
+                                               num_heads=num_heads,
+                                               batch_first=True)
+        self.fc = nn.Linear(embed_size,embed_size)
+
+    def forward(self,image_embeddings,handcraft_embeddings):
+        image_embeddings = self.image_proj(image_embeddings.unsqueeze(1))
+        handcraft_embeddings = self.handcraft_proj(handcraft_embeddings.unsqueeze(1))
+        combined,_ = self.attention(image_embeddings,handcraft_embeddings,handcraft_embeddings)
+        return self.fc(combined).squeeze(1)
+    
+#3. 数据级融合，即简单拼接两个模态，无法学习模态间关系
+class Datafusion(nn.Module):
+    def __init__(self, img_input_dim,handcraft_input_dim,hidden_dim):
+        super().__init__()
+        self.image_proj = nn.Linear(img_input_dim,hidden_dim)
+        self.handcraft_proj = nn.Linear(handcraft_input_dim,hidden_dim)
+        self.fusion_layer = nn.Linear(hidden_dim*2,hidden_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self,image_embeddings,handcraft_embeddings):
+        image_embeddings = self.relu(self.image_proj(image_embeddings))
+        handcraft_embeddings = self.relu(self.handcraft_proj(handcraft_embeddings))
+        fused_features = torch.cat((image_embeddings,handcraft_embeddings),dim=1)
+        fused_output = self.relu(self.fusion_layer(fused_features))
+        return(fused_output)
+
+
+#4. 特征级融合（基于注意力机制）
+class AttentionFusion(nn.Module):
+    def __init__(self, img_input_dim,handcraft_input_dim,hidden_dim):
+        super().__init__()
+        self.image_proj = nn.Linear(img_input_dim,hidden_dim)
+        self.handcraft_proj = nn.Linear(handcraft_input_dim,hidden_dim)
+        self.image_attention = nn.Linear(hidden_dim,1)
+        self.handcraft_attention = nn.Linear(hidden_dim,1)
+        self.fusion_layer = nn.Linear(hidden_dim*2,hidden_dim)
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self,image_embeddings,handcraft_embeddings):
+        image_embeddings = self.relu(self.image_proj(image_embeddings))
+        handcraft_embeddings = self.relu(self.handcraft_proj(handcraft_embeddings))
+        #两个模态的权重
+        image_weights = self.softmax(self.image_attention(image_embeddings))
+        handcraft_weights = self.softmax(self.handcraft_attention(handcraft_embeddings))
+        #加权拼接
+        weighted_image = image_embeddings*image_weights
+        weighted_handcraft = handcraft_embeddings*handcraft_weights
+        fused_features = torch.cat((weighted_image,weighted_handcraft),dim=1)
+        fused_output = self.relu(self.fusion_layer(fused_features))
+        return fused_output
+        
+# 自注意力模块
+class SingleModalSelfAttention(nn.Module):
+    def __init__(self,input_size,embed_size, num_heads):
+        super().__init__()
+        self.proj = nn.Linear(input_size,embed_size)
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=embed_size,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        self.fc = nn.Linear(embed_size, embed_size)
+
+    def forward(self, modal_embeddings):
+        modal_seq = self.proj(modal_embeddings.unsqueeze(1))
+        attn_out, _ = self.self_attention(
+            query=modal_seq,
+            key=modal_seq,
+            value=modal_seq
+        )
+        enhanced_emb = self.fc(attn_out).squeeze(1)
+        return enhanced_emb
