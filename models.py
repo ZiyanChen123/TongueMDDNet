@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torchvision.models as models
+from torchvision.models import ResNet50_Weights
+from torchvision import transforms
 ########原版Resnet18########
 class Residual(nn.Module):
     def __init__(self,input_channels,num_channels,
@@ -182,29 +185,79 @@ class ResNet_attn(nn.Module):
         output = self.classifier(fused_feat)  # (batch, num_classes)
         return output
 
-###跨模态对齐方法###
-#占位，各种特征的编码器
+
+#基于resnet50预训练模型的编码器
 class ImageEmbedding(nn.Module):
-    def __init__(self, input_dim,hidden_dim):
+    def __init__(self, input_dim,hidden_dim=512):
         super().__init__()
+        self.resnet50 = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+        self.backbone = nn.Sequential(*list(self.resnet50.children())[:-2])
+        #固定模型权重
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(2048, hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, images):
+        # images: 输入形状 [batch_size, 3, 224, 224]
+        # 1. ResNet主干提取特征：输出 [batch_size, 2048, 7, 7]
+        features = self.backbone(images)
+        # 2. 全局平均池化：将7×7的空间特征压缩为1×1，输出 [batch_size, 2048, 1, 1]
+        pooled_features = self.avg_pool(features)
+        # 3. 展平：输出 [batch_size, 2048]
+        flattened = pooled_features.view(pooled_features.size(0), -1)
+        # 4. 维度压缩到512维：输出 [batch_size, 512]
+        embedding = self.dropout(self.relu(self.fc(flattened)))
+        return embedding
 
-    def forward(self,images):
-        return images
-    
+# 图像手工特征编码器
 class HandcraftEmbedding(nn.Module):
-    def __init__(self, input_dim,hidden_dim):
+    def __init__(self, input_dim, hidden_dim=512):
         super().__init__()
+        self.handcraft_dim = input_dim
+        self.handcraft_proj = nn.Linear(self.handcraft_dim, hidden_dim)
+        self.relu = nn.ReLU()
 
-    def forward(self,handcraft_features):
-        return handcraft_features
-    
-class AudioEmbedding(nn.Module):
-    def __init__(self, input_dim,hidden_dim):
+    def forward(self, handcraft_features):
+        return self.relu(self.handcraft_proj(handcraft_features))
+
+
+# 二分类头
+class BinaryClassificationHead(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=256, dropout_rate=0.1):
+        """
+        通用二分类头
+
+        """
         super().__init__()
+        self.classifier = nn.Sequential(
+            # 第一层特征压缩
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # 层归一化，提升训练稳定性
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            
+            # 第二层特征压缩
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            
+            # 输出层：二分类（logits）
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        self.sigmoid = nn.Sigmoid()  # 将logits转为0-1概率
 
-    def forward(self,audios):
-        return audios
-    
+    def forward(self, fused_features, return_prob=True):
+        logits = self.classifier(fused_features)
+        if return_prob:
+            return self.sigmoid(logits)
+        return logits
+
+
+###跨模态对齐方法###
 #1. 通过嵌入对齐和优化损失函数融合
 #基于余弦相似度的对比损失(训练时用这个损失函数)
 class ContrastiveLoss(nn.Module):
@@ -235,7 +288,29 @@ class CrossModalAlignment(nn.Module):
         handcraft_embeddings = self.handcraft_proj(handcraft_embeddings.unsqueeze(1))
         combined,_ = self.attention(image_embeddings,handcraft_embeddings,handcraft_embeddings)
         return self.fc(combined).squeeze(1)
-    
+# 自注意力模块
+class SingleModalSelfAttention(nn.Module):
+    def __init__(self,input_size,embed_size, num_heads):
+        super().__init__()
+        self.proj = nn.Linear(input_size,embed_size)
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=embed_size,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        self.fc = nn.Linear(embed_size, embed_size)
+
+    def forward(self, modal_embeddings):
+        modal_seq = self.proj(modal_embeddings.unsqueeze(1))
+        attn_out, _ = self.self_attention(
+            query=modal_seq,
+            key=modal_seq,
+            value=modal_seq
+        )
+        enhanced_emb = self.fc(attn_out).squeeze(1)
+        return enhanced_emb
+     
+
 #3. 数据级融合，即简单拼接两个模态，无法学习模态间关系
 class Datafusion(nn.Module):
     def __init__(self, img_input_dim,handcraft_input_dim,hidden_dim):
@@ -278,24 +353,172 @@ class AttentionFusion(nn.Module):
         fused_output = self.relu(self.fusion_layer(fused_features))
         return fused_output
         
-# 自注意力模块
-class SingleModalSelfAttention(nn.Module):
-    def __init__(self,input_size,embed_size, num_heads):
-        super().__init__()
-        self.proj = nn.Linear(input_size,embed_size)
-        self.self_attention = nn.MultiheadAttention(
-            embed_dim=embed_size,
-            num_heads=num_heads,
-            batch_first=True
-        )
-        self.fc = nn.Linear(embed_size, embed_size)
 
-    def forward(self, modal_embeddings):
-        modal_seq = self.proj(modal_embeddings.unsqueeze(1))
-        attn_out, _ = self.self_attention(
-            query=modal_seq,
-            key=modal_seq,
-            value=modal_seq
+#5. 门控融合机制
+class GatedFusionNetwork(nn.Module):
+    def __init__(self, input_size1, input_size2, hidden_size):
+        super(GatedFusionNetwork, self).__init__()
+        self.pathway1 = nn.Linear(input_size1, hidden_size)
+        self.pathway2 = nn.Linear(input_size2, hidden_size)
+        self.gating = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Sigmoid()
         )
-        enhanced_emb = self.fc(attn_out).squeeze(1)
-        return enhanced_emb
+        self.fusion_layer = nn.Linear(hidden_size, hidden_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, input1, input2):
+        out1 = self.relu(self.pathway1(input1))
+        out2 = self.relu(self.pathway2(input2))
+        fused = torch.cat((out1, out2), dim=1)
+        gate = self.gating(fused)
+        gated_output = gate * out1 + (1 - gate) * out2
+        fused_output = self.relu(self.fusion_layer(gated_output))
+        return fused_output
+
+class CrossModalBinaryClassifier(nn.Module):
+    def __init__(
+        self,
+        img_input_dim=3,
+        handcraft_input_dim=100,
+        embed_size=512,
+        num_heads=8,
+        fusion_type="attention_fusion",
+        dropout_rate=0.1
+    ):
+        """
+        整合图像编码器、手工特征编码器、融合模块、分类头的完整模型
+        Args:
+            fusion_type: 融合方式，可选值：
+                - contrastive: 对比损失对齐（需配合ContrastiveLoss训练）
+                - cross_attention: 交叉注意力对齐
+                - datafusion: 简单拼接
+                - attention_fusion: 注意力加权融合
+                - gated: 门控融合
+        """
+        super().__init__()
+        
+        # 1. 基础编码器
+        self.image_encoder = ImageEmbedding(input_dim=img_input_dim, hidden_dim=embed_size)
+        self.handcraft_encoder = HandcraftEmbedding(input_dim=handcraft_input_dim, hidden_dim=embed_size)
+        
+        # 2. 选择融合模块
+        self.fusion_type = fusion_type
+        if fusion_type == "cross_attention":
+            self.fusion_module = CrossModalAlignment(
+                img_input_dim=embed_size,
+                handcraft_input_dim=embed_size,
+                embed_size=embed_size,
+                num_heads=num_heads
+            )
+        elif fusion_type == "datafusion":
+            self.fusion_module = Datafusion(
+                img_input_dim=embed_size,
+                handcraft_input_dim=embed_size,
+                hidden_dim=embed_size
+            )
+        elif fusion_type == "attention_fusion":
+            self.fusion_module = AttentionFusion(
+                img_input_dim=embed_size,
+                handcraft_input_dim=embed_size,
+                hidden_dim=embed_size
+            )
+        elif fusion_type == "gated":
+            self.fusion_module = GatedFusionNetwork(
+                input_size1=embed_size,
+                input_size2=embed_size,
+                hidden_size=embed_size
+            )
+        elif fusion_type == "contrastive":
+            # 对比损失仅用于对齐，融合用简单拼接
+            self.fusion_module = Datafusion(
+                img_input_dim=embed_size,
+                handcraft_input_dim=embed_size,
+                hidden_dim=embed_size
+            )
+            self.contrastive_loss = ContrastiveLoss(margin=1.0)
+        
+        # 3. 通用二分类头
+        self.classification_head = BinaryClassificationHead(
+            input_dim=embed_size,
+            hidden_dim=embed_size // 2,
+            dropout_rate=dropout_rate
+        )
+
+    def forward(self, images, handcraft_features, labels=None):
+        """
+        前向传播
+        Args:
+            images: 图像张量 [batch_size, 3, 224, 224]
+            handcraft_features: 手工特征张量 [batch_size, handcraft_input_dim]
+            labels: 标签（仅训练时需要）[batch_size, 1]
+        Returns:
+            如果labels=None: 二分类概率 [batch_size, 1]
+            如果labels≠None: 字典，包含概率、分类损失（、对比损失）
+        """
+        # 1. 编码特征
+        img_emb = self.image_encoder(images)
+        hand_emb = self.handcraft_encoder(handcraft_features)
+        
+        # 2. 特征融合
+        fused_feat = self.fusion_module(img_emb, hand_emb)
+        
+        # 3. 分类预测
+        pred_prob = self.classification_head(fused_feat, return_prob=True)
+        
+        # 4. 计算损失（训练阶段）
+        if labels is not None:
+            # 分类损失（用logits计算，避免sigmoid梯度消失）
+            pred_logits = self.classification_head(fused_feat, return_prob=False)
+            bce_loss = nn.functional.binary_cross_entropy_with_logits(pred_logits, labels.float())
+            
+            # 如果是对比损失融合，额外计算对比损失
+            total_loss = bce_loss
+            if self.fusion_type == "contrastive":
+                contr_loss = self.contrastive_loss(img_emb, hand_emb, labels)
+                total_loss = bce_loss + 0.1 * contr_loss  # 对比损失权重可调整
+                
+            return {
+                "pred_prob": pred_prob,
+                "classification_loss": bce_loss,
+                "total_loss": total_loss,
+                "contrastive_loss": contr_loss if self.fusion_type == "contrastive" else None
+            }
+        
+        # 推理阶段仅返回预测概率
+        return pred_prob
+
+# ------------------- 测试代码 -------------------
+if __name__ == "__main__":
+    # 1. 初始化模型（测试门控融合+二分类头）
+    model = CrossModalBinaryClassifier(
+        handcraft_input_dim=100,  # 假设手工特征是100维
+        fusion_type="gated"
+    )
+    
+    # 2. 构造测试数据
+    batch_size = 4
+    test_images = torch.randn(batch_size, 3, 224, 224)  # 图像输入
+    test_handcraft = torch.randn(batch_size, 100)       # 手工特征输入
+    test_labels = torch.randint(0, 2, (batch_size, 1))  # 二分类标签
+    
+    # 3. 训练模式（带损失计算）
+    model.train()
+    output = model(test_images, test_handcraft, test_labels)
+    print("训练模式输出：")
+    print(f"预测概率形状: {output['pred_prob'].shape}")
+    print(f"分类损失: {output['classification_loss'].item():.4f}")
+    print(f"总损失: {output['total_loss'].item():.4f}")
+    
+    # 4. 推理模式（仅预测）
+    model.eval()
+    with torch.no_grad():
+        pred = model(test_images, test_handcraft)
+    print("\n推理模式输出：")
+    print(f"预测概率形状: {pred.shape}")
+    
+    # 修复：格式化numpy数组的正确方式
+    pred_np = pred.squeeze().numpy()
+    # 方式1：遍历元素格式化
+    pred_formatted = [f"{p:.4f}" for p in pred_np]
+    print(f"预测概率示例: {', '.join(pred_formatted)}")
