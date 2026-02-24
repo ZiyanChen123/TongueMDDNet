@@ -2,8 +2,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 import torchvision.models as models
-from torchvision.models import ResNet50_Weights
-from torchvision import transforms
+from torchvision.models import (
+    DenseNet169_Weights, MobileNet_V3_Small_Weights,
+    SqueezeNet1_1_Weights, VGG19_BN_Weights
+)
 ########原版Resnet18########
 class Residual(nn.Module):
     def __init__(self,input_channels,num_channels,
@@ -186,29 +188,47 @@ class ResNet_attn(nn.Module):
         return output
 
 
-#基于resnet50预训练模型的编码器
+#基于预训练模型的编码器
 class ImageEmbedding(nn.Module):
-    def __init__(self, input_dim,hidden_dim=512):
+    def __init__(self, model_name="resnet50", hidden_dim=512):
         super().__init__()
-        self.resnet50 = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-        self.backbone = nn.Sequential(*list(self.resnet50.children())[:-2])
-        #固定模型权重
+        # 根据model_name选择预训练模型
+        if model_name == "densenet169":
+            self.backbone_model = models.densenet169(weights=DenseNet169_Weights.IMAGENET1K_V1)
+            self.backbone = nn.Sequential(*list(self.backbone_model.children())[:-1])  # 移除分类层
+            self.backbone_out_dim = 1664  # DenseNet169输出维度
+        elif model_name == "mobilenet_v3_small":
+            self.backbone_model = models.mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+            self.backbone = nn.Sequential(*list(self.backbone_model.children())[:-1])  # 移除分类层
+            self.backbone_out_dim = 576  # MobileNetV3Small输出维度
+        elif model_name == "squeezenet1_1":
+            self.backbone_model = models.squeezenet1_1(weights=SqueezeNet1_1_Weights.IMAGENET1K_V1)
+            self.backbone = nn.Sequential(*list(self.backbone_model.children())[:-1])  # 移除分类层
+            self.backbone_out_dim = 512  # SqueezeNet输出维度
+        elif model_name == "vgg19_bn":
+            self.backbone_model = models.vgg19_bn(weights=VGG19_BN_Weights.IMAGENET1K_V1)
+            self.backbone = nn.Sequential(*list(self.backbone_model.children())[:-1])  # 移除分类层
+            self.backbone_out_dim = 512  # VGG19_bn输出维度
+        else:  # 默认ResNet50
+            self.backbone_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            self.backbone = nn.Sequential(*list(self.backbone_model.children())[:-2])
+            self.backbone_out_dim = 2048
+
+        # 固定预训练权重
         for param in self.backbone.parameters():
             param.requires_grad = False
+
+        # 全局池化（适配所有模型）
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(2048, hidden_dim)
+        # 特征压缩到hidden_dim（512）
+        self.fc = nn.Linear(self.backbone_out_dim, hidden_dim)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.1)
-        
+
     def forward(self, images):
-        # images: 输入形状 [batch_size, 3, 224, 224]
-        # 1. ResNet主干提取特征：输出 [batch_size, 2048, 7, 7]
         features = self.backbone(images)
-        # 2. 全局平均池化：将7×7的空间特征压缩为1×1，输出 [batch_size, 2048, 1, 1]
         pooled_features = self.avg_pool(features)
-        # 3. 展平：输出 [batch_size, 2048]
         flattened = pooled_features.view(pooled_features.size(0), -1)
-        # 4. 维度压缩到512维：输出 [batch_size, 512]
         embedding = self.dropout(self.relu(self.fc(flattened)))
         return embedding
 
@@ -399,7 +419,7 @@ class CrossModalBinaryClassifier(nn.Module):
         super().__init__()
         
         # 1. 基础编码器
-        self.image_encoder = ImageEmbedding(input_dim=img_input_dim, hidden_dim=embed_size)
+        self.image_encoder = ImageEmbedding(model_name="squeezenet1_1", hidden_dim=512)
         self.handcraft_encoder = HandcraftEmbedding(input_dim=handcraft_input_dim, hidden_dim=embed_size)
         
         # 2. 选择融合模块
