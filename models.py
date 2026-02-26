@@ -234,14 +234,51 @@ class ImageEmbedding(nn.Module):
 
 # 图像手工特征编码器
 class HandcraftEmbedding(nn.Module):
-    def __init__(self, input_dim, hidden_dim=512):
+    def __init__(self, input_dim = 2485 , hidden_dim=512):
         super().__init__()
         self.handcraft_dim = input_dim
         self.handcraft_proj = nn.Linear(self.handcraft_dim, hidden_dim)
+        # 手工特征权重
+        self.feature_units = [
+            # 标量特征：21个，每个特征1个权重（共21个）
+            (0, 21, 21),
+            # LBP直方图：256维，1个权重
+            (21, 277, 1),
+            # LTP直方图：512维，1个权重
+            (277, 789, 1),
+            # HOG特征：1568维，1个权重
+            (789, 2357, 1),
+            # SIFT特征：128维，1个权重
+            (2357, 2485, 1)
+        ]
+        total_weight_num = sum([unit[2] for unit in self.feature_units])
+        self.weights = nn.Parameter(torch.ones(total_weight_num, dtype=torch.float32))
         self.relu = nn.ReLU()
 
     def forward(self, handcraft_features):
-        return self.relu(self.handcraft_proj(handcraft_features))
+        weighted_parts = []
+        weight_idx = 0  # 权重索引指针
+        
+        for start, end, weight_num in self.feature_units:
+            # 提取当前单元特征
+            feat_part = handcraft_features[:, start:end]  # (batch, unit_dim)
+            # 提取当前单元对应的权重
+            w = self.weights[weight_idx:weight_idx+weight_num]  # (weight_num,)
+            weight_idx += weight_num
+            
+            # 加权：标量逐特征加权，高维组广播加权
+            if weight_num > 1:
+                # 标量单元：逐特征加权
+                weighted_part = feat_part * w.unsqueeze(0)
+            else:
+                # 高维组：1个权重广播到整个组
+                weighted_part = feat_part * w
+            
+            weighted_parts.append(weighted_part)
+        
+        # 拼接所有加权特征 → 恢复2485维
+        weighted_feat = torch.cat(weighted_parts, dim=1)
+        return self.relu(self.handcraft_proj(weighted_feat))
 
 
 # 二分类头
@@ -400,7 +437,7 @@ class CrossModalBinaryClassifier(nn.Module):
     def __init__(
         self,
         img_input_dim=3,
-        handcraft_input_dim=100,
+        handcraft_input_dim=2485,
         embed_size=512,
         num_heads=8,
         fusion_type="attention_fusion",
@@ -504,22 +541,20 @@ class CrossModalBinaryClassifier(nn.Module):
                 "total_loss": total_loss,
                 "contrastive_loss": contr_loss if self.fusion_type == "contrastive" else None
             }
-        
-        # 推理阶段仅返回预测概率
         return pred_prob
 
 # ------------------- 测试代码 -------------------
 if __name__ == "__main__":
     # 1. 初始化模型（测试门控融合+二分类头）
     model = CrossModalBinaryClassifier(
-        handcraft_input_dim=100,  # 假设手工特征是100维
+        handcraft_input_dim=2485,  # 假设手工特征是100维
         fusion_type="gated"
     )
     
     # 2. 构造测试数据
     batch_size = 4
     test_images = torch.randn(batch_size, 3, 224, 224)  # 图像输入
-    test_handcraft = torch.randn(batch_size, 100)       # 手工特征输入
+    test_handcraft = torch.randn(batch_size, 2485)       # 手工特征输入
     test_labels = torch.randint(0, 2, (batch_size, 1))  # 二分类标签
     
     # 3. 训练模式（带损失计算）

@@ -163,14 +163,14 @@ valid_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
 
 
 # =================读入对照组=================
-for fname in os.listdir("./对照组舌苔/对照组舌苔图像102例"):
-    ext = os.path.splitext(fname)[1].lower()
-    if ext in valid_exts:
-        full_path = os.path.join("./对照组舌苔/对照组舌苔图像102例", fname)
-        data_records.append({
-            "filename": fname,
-            "filepath": full_path
-        })
+# for fname in os.listdir("./对照组舌苔/对照组舌苔图像102例"):
+#     ext = os.path.splitext(fname)[1].lower()
+#     if ext in valid_exts:
+#         full_path = os.path.join("./对照组舌苔/对照组舌苔图像102例", fname)
+#         data_records.append({
+#             "filename": fname,
+#             "filepath": full_path
+#         })
 
 for fname in os.listdir("./舌苔/1.MH健康对照组（有转录）"):
     ext = os.path.splitext(fname)[1].lower()

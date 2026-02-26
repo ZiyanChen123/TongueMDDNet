@@ -238,7 +238,7 @@ def calculate_image_metrics(img_masked):
 
 def convert_metrics_to_array(metrics):
     """
-    将手工特征字典转换为一维数组，适配模型融合
+    将手工特征字典转换为一维数组，适配模型融合,目前总长2485
     参数：
         metrics: calculate_image_metrics返回的特征字典
         device: 张量设备（'cuda'）
@@ -252,7 +252,8 @@ def convert_metrics_to_array(metrics):
         'L_Mean', 'a_Mean', 'b_Mean_Lab',
         'Mean', 'Contrast', 'ASM', 'Entropy', 'perAll',
         'LBP_Mean', 'LTP_Mean', 'SIFT_Keypoint_Count', 'HOG_Mean'
-    ]
+    ]#21维标量
+
     # 提取标量值并转为numpy数组
     scalar_features = np.array([metrics[k] for k in scalar_keys], dtype=np.float32)
 
@@ -260,7 +261,7 @@ def convert_metrics_to_array(metrics):
     lbp_hist = metrics['LBP_Hist'].astype(np.float32)
     # LTP_Hist：固定512维
     ltp_hist = metrics['LTP_Hist'].astype(np.float32)
-    # HOG_Feature：
+    # HOG_Feature：1568维
     hog_feature = metrics['HOG_Feature'].astype(np.float32)
     
     # ---------------- 3. 处理不规则的SIFT特征----------------
